@@ -74,6 +74,7 @@ jobs:
               --theater 0013 \
               --dates 20260809 20260816 \
               --movie 스파이더맨 \
+              --halls 144 \
               --min-seats 2 || echo "이번 회차 실패, 계속 진행"
             if [ "$i" -lt "$POLLS" ]; then sleep 60; fi
           done
