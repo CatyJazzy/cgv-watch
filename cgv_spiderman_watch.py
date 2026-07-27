@@ -56,8 +56,18 @@ def fetch_timetable(theater: str, play_date: str, timeout: int = 25) -> list[dic
     return payload.get("data", {}).get("timetable") or []
 
 
-def select(rows: list[dict], movie: str, after: str | None, before: str | None) -> list[dict]:
-    """영화명 부분일치 + 상영 시작시각 범위로 회차를 추린다."""
+def select(
+    rows: list[dict],
+    movie: str,
+    after: str | None,
+    before: str | None,
+    halls: list[int] | None = None,
+) -> list[dict]:
+    """영화명 부분일치 + 시작시각 범위 + 상영관으로 회차를 추린다.
+
+    API가 상영관 이름(4DX/IMAX 등)을 주지 않기 때문에, 관은 `totalSeats` 로 식별한다.
+    같은 극장에서 관마다 총좌석수가 달라 사실상 관 ID 역할을 한다.
+    """
     out = []
     for r in rows:
         if movie not in r.get("movieName", ""):
@@ -66,6 +76,8 @@ def select(rows: list[dict], movie: str, after: str | None, before: str | None) 
         if after and start < after:
             continue
         if before and start > before:
+            continue
+        if halls and r.get("totalSeats") not in halls:
             continue
         out.append(r)
     return sorted(out, key=lambda r: r.get("startTime", ""))
@@ -209,9 +221,10 @@ def check_once(cfg, state: dict, first_run: bool) -> None:
             print(f"[{play_date}] 조회 실패 (다음 주기에 재시도): {exc}", file=sys.stderr)
             continue
 
-        hits = select(rows, cfg.movie, cfg.after, cfg.before)
+        hits = select(rows, cfg.movie, cfg.after, cfg.before, cfg.halls)
         prev = state.get(play_date, {})
         prev_open = bool(prev.get("open"))
+        prev_date_open = bool(prev.get("date_open"))
         prev_seats: dict = prev.get("seats", {})
 
         stamp = datetime.now(KST).strftime("%m-%d %H:%M:%S")
@@ -222,12 +235,32 @@ def check_once(cfg, state: dict, first_run: bool) -> None:
             flush=True,
         )
 
-        # 1) 예매 오픈 감지 — 스파이더맨 회차가 0개였다가 생겼을 때
+        # 1) 예매 오픈 감지 — 조건에 맞는 회차가 0개였다가 생겼을 때
         if hits and not prev_open and not first_run:
             alert(
                 cfg,
                 f"🎬 예매 오픈! {play_date} {cfg.movie}",
                 [f"{len(hits)}개 회차가 열렸습니다."] + [label(r) for r in hits[:8]],
+            )
+
+        # 1-b) 날짜 시간표는 열렸는데 조건에 맞는 회차가 없을 때.
+        #      상영관/시간대로 좁혀 감시하면 이 경우 위 알림이 영영 안 오므로,
+        #      "열렸지만 원하는 회차는 없다"는 사실 자체를 한 번 알려준다.
+        elif rows and not hits and not prev_date_open and not first_run:
+            narrowed = []
+            if cfg.halls:
+                narrowed.append(f"상영관 {cfg.halls}석")
+            if cfg.after or cfg.before:
+                narrowed.append(f"시간대 {cfg.after or '~'}~{cfg.before or '~'}")
+            alert(
+                cfg,
+                f"⚠️ {play_date} 시간표는 열렸으나 조건에 맞는 회차 없음",
+                [
+                    f"전체 {len(rows)}회차가 열렸지만 '{cfg.movie}'"
+                    + (f" ({', '.join(narrowed)})" if narrowed else "")
+                    + " 조건에 맞는 회차가 없습니다.",
+                    "조건을 넓히거나 다른 날짜를 확인하세요.",
+                ],
             )
 
         # 2) 빈좌석 감지 — 직전에 기준 미달이던 회차가 기준을 넘겼을 때
@@ -246,11 +279,38 @@ def check_once(cfg, state: dict, first_run: bool) -> None:
 
         state[play_date] = {
             "open": bool(hits),
+            "date_open": bool(rows),
             "seats": {key_of(r): (r.get("remainingSeats") or 0) for r in hits},
             "checked_at": datetime.now(KST).isoformat(timespec="seconds"),
         }
 
     save_state(cfg.state_file, state)
+
+
+def list_halls(cfg) -> None:
+    """상영관(총좌석수)별로 회차를 묶어 보여준다. 어느 관이 4DX인지 대조하는 용도."""
+    for play_date in cfg.dates:
+        try:
+            rows = fetch_timetable(cfg.theater, play_date)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{play_date}: 조회 실패 — {exc}")
+            continue
+        hits = select(rows, cfg.movie, cfg.after, cfg.before, None)
+        try:
+            dow = WEEKDAYS[datetime.strptime(play_date, "%Y%m%d").weekday()]
+        except ValueError:
+            dow = "?"
+        print(f"\n=== {play_date}({dow}) '{cfg.movie}' 상영관별 회차 ===")
+        if not hits:
+            print("  해당 회차 없음")
+            continue
+        by_hall: dict = {}
+        for r in hits:
+            by_hall.setdefault(r.get("totalSeats"), []).append(r)
+        for seats in sorted(by_hall, key=lambda x: -(x or 0)):
+            times = " ".join(r.get("startTime", "") for r in by_hall[seats])
+            print(f"  [{seats:>4}석] {len(by_hall[seats]):>2}회차  {times}")
+        print("  CGV 앱에서 4DX 상영 시각을 찾아 위 표의 어느 줄인지 대조하세요.")
 
 
 def print_status(cfg) -> None:
@@ -260,7 +320,7 @@ def print_status(cfg) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"{play_date}: 조회 실패 — {exc}")
             continue
-        hits = select(rows, cfg.movie, cfg.after, cfg.before)
+        hits = select(rows, cfg.movie, cfg.after, cfg.before, cfg.halls)
         try:
             dow = WEEKDAYS[datetime.strptime(play_date, "%Y%m%d").weekday()]
         except ValueError:
@@ -285,6 +345,20 @@ def main() -> int:
     p.add_argument("--min-seats", type=int, default=2, help="이 좌석 수 이상이면 알림 (기본 2)")
     p.add_argument("--after", default=None, help="이 시각 이후 회차만 (HH:MM)")
     p.add_argument("--before", default=None, help="이 시각 이전 회차만 (HH:MM)")
+    p.add_argument(
+        "--halls",
+        nargs="+",
+        type=int,
+        default=None,
+        metavar="총좌석수",
+        help="특정 상영관만 감시. API가 관 이름을 안 주므로 총좌석수로 관을 지정한다 "
+             "(예: 4DX관이 200석이면 --halls 200). --list-halls 로 확인.",
+    )
+    p.add_argument(
+        "--list-halls",
+        action="store_true",
+        help="해당 날짜의 상영관(총좌석수)별 회차를 표로 출력하고 종료",
+    )
     p.add_argument("--interval", type=int, default=300, help="폴링 간격(초), 최소 60 (기본 300)")
     p.add_argument("--once", action="store_true", help="현재 상태만 출력하고 종료")
     p.add_argument(
@@ -328,6 +402,10 @@ def main() -> int:
 
     if cfg.test_notify:
         alert(cfg, "🔔 CGV 감시기 알림 테스트", ["이 메시지가 보이면 알림 설정 완료입니다."])
+        return 0
+
+    if cfg.list_halls:
+        list_halls(cfg)
         return 0
 
     if cfg.once:
